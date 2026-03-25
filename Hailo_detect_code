@@ -1,0 +1,260 @@
+#!/usr/bin/env python3
+"""Example module for Hailo Detection with Performance Monitoring."""
+import argparse
+import numpy as np
+import cv2
+import csv
+import time
+import psutil
+import threading
+import pandas as pd
+from picamera2 import MappedArray, Picamera2, Preview
+from picamera2.devices import Hailo
+# ==================== MONITORING VARIABLEN ====================
+monitoring_active = False
+monitoring_file = None
+monitoring_writer = None
+monitoring_start_time = None
+frame_count = 0
+last_fps_time = None
+current_fps = 0
+# ==============================================================
+
+def extract_detections(hailo_output, w, h, class_names, threshold=0.5):
+    """Extract detections from the HailoRT-postprocess output."""
+    results = []
+    for class_id, detections in enumerate(hailo_output):
+        for detection in detections:
+            score = detection[4]
+            if score >= threshold:
+                y0, x0, y1, x1 = detection[:4]
+                if np.isnan(y0) or np.isnan(x0) or np.isnan(y1) or np.isnan(x1):
+                    continue
+                bbox = (int(x0 * w), int(y0 * h), int(x1 * w), int(y1 * h))
+                results.append([class_names[class_id], bbox, score])
+    return results
+
+def draw_objects(request):
+    global frame_count, last_fps_time, current_fps
+    
+    # ==================== FPS BERECHNUNG ====================
+    frame_count += 1
+    current_time = time.time()
+    if last_fps_time is None:
+        last_fps_time = current_time
+    elif current_time - last_fps_time >= 1.0:
+        current_fps = frame_count / (current_time - last_fps_time)
+        frame_count = 0
+        last_fps_time = current_time
+    # ========================================================
+    
+    current_detections = detections
+    if current_detections:
+        with MappedArray(request, "main") as m:
+            # Zeichne FPS Anzeige
+            fps_text = f"FPS: {current_fps:.1f}"
+            cv2.putText(m.array, fps_text, (10, 30),
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA)
+            
+            # Zeichne Detections
+            for class_name, bbox, score in current_detections:
+                x0, y0, x1, y1 = bbox
+                label = f"{class_name} %{int(score * 100)}"
+                cv2.rectangle(m.array, (x0, y0), (x1, y1), (0, 255, 0, 0), 2)
+                cv2.putText(m.array, label, (x0 + 5, y0 + 15),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0, 0), 1, cv2.LINE_AA)
+
+# ==================== MONITORING FUNKTIONEN ====================
+def start_monitoring(output_csv="hailo_performance_monitoring.csv"):
+    """Startet Monitoring in separatem Thread."""
+    global monitoring_active, monitoring_file, monitoring_writer, monitoring_start_time
+    
+    monitoring_file = open(output_csv, 'w', newline='')
+    monitoring_writer = csv.writer(monitoring_file)
+    monitoring_writer.writerow([
+        "Zeit_s", "FPS", "CPU_Gesamt_%", "CPU_Per_Core", 
+        "RAM_Used_MB", "RAM_Percent_%"
+    ])
+    monitoring_start_time = time.time()
+    monitoring_active = True
+    
+    def monitor_loop():
+        """Background-Thread fÃ¼r kontinuierliches Monitoring."""
+        while monitoring_active:
+            elapsed = time.time() - monitoring_start_time
+            
+            # System-Ressourcen
+            cpu_total = psutil.cpu_percent(interval=0.5)
+            cpu_per_core = psutil.cpu_percent(interval=None, percpu=True)
+            mem = psutil.virtual_memory()
+            ram_mb = mem.used / (1024 * 1024)
+            ram_percent = mem.percent
+            
+            # In CSV schreiben
+            cpu_cores_str = ";".join([f"{c:.1f}" for c in cpu_per_core])
+            monitoring_writer.writerow([
+                round(elapsed, 2),
+                round(current_fps, 1),
+                round(cpu_total, 1),
+                cpu_cores_str,
+                round(ram_mb, 1),
+                round(ram_percent, 1)
+            ])
+            
+            # Live-Ausgabe alle 5 Sekunden
+            if int(elapsed) % 5 == 0 and elapsed - int(elapsed) < 0.6:
+                print(f"[MONITOR] Zeit: {elapsed:.0f}s | FPS: {current_fps:.1f} | "
+                      f"CPU: {cpu_total:.1f}% | RAM: {ram_mb:.0f}MB")
+    
+    # Thread starten
+    monitor_thread = threading.Thread(target=monitor_loop, daemon=True)
+    monitor_thread.start()
+    print(f"[MONITOR] Gestartet -> {output_csv}\n")
+
+def stop_monitoring(output_csv):
+    """Beendet Monitoring, berechnet Statistiken und schlieÃŸt CSV-Datei."""
+    global monitoring_active, monitoring_file
+    
+    monitoring_active = False
+    time.sleep(0.6)  # Warte auf letzten Loop-Durchlauf
+    
+    if monitoring_file:
+        monitoring_file.close()
+        
+        # ========== STATISTIKEN BERECHNEN ==========
+        calculate_statistics(output_csv)
+        # ===========================================
+        
+        print(f"\n[MONITOR] Beendet. Log und Statistiken gespeichert.")
+
+def calculate_statistics(csv_file):
+    """Berechnet Durchschnitt und Median und fÃ¼gt sie ans CSV an."""
+    try:
+        # CSV einlesen
+        df = pd.read_csv(csv_file)
+        
+        # Nur Zeilen mit FPS > 0 fÃ¼r genaue Statistiken (nach Warmup)
+        df_active = df[df['FPS'] > 0]
+        
+        if len(df_active) == 0:
+            print("[WARNUNG] Keine aktiven Frames fÃ¼r Statistik gefunden")
+            return
+        
+        # Statistiken berechnen
+        stats = {
+            'Zeit_s': 'DURCHSCHNITT',
+            'FPS': round(df_active['FPS'].mean(), 2),
+            'CPU_Gesamt_%': round(df_active['CPU_Gesamt_%'].mean(), 2),
+            'CPU_Per_Core': '-',
+            'RAM_Used_MB': round(df_active['RAM_Used_MB'].mean(), 1),
+            'RAM_Percent_%': round(df_active['RAM_Percent_%'].mean(), 2)
+        }
+        
+        median_stats = {
+            'Zeit_s': 'MEDIAN',
+            'FPS': round(df_active['FPS'].median(), 2),
+            'CPU_Gesamt_%': round(df_active['CPU_Gesamt_%'].median(), 2),
+            'CPU_Per_Core': '-',
+            'RAM_Used_MB': round(df_active['RAM_Used_MB'].median(), 1),
+            'RAM_Percent_%': round(df_active['RAM_Percent_%'].median(), 2)
+        }
+        
+        min_stats = {
+            'Zeit_s': 'MINIMUM',
+            'FPS': round(df_active['FPS'].min(), 2),
+            'CPU_Gesamt_%': round(df_active['CPU_Gesamt_%'].min(), 2),
+            'CPU_Per_Core': '-',
+            'RAM_Used_MB': round(df_active['RAM_Used_MB'].min(), 1),
+            'RAM_Percent_%': round(df_active['RAM_Percent_%'].min(), 2)
+        }
+        
+        max_stats = {
+            'Zeit_s': 'MAXIMUM',
+            'FPS': round(df_active['FPS'].max(), 2),
+            'CPU_Gesamt_%': round(df_active['CPU_Gesamt_%'].max(), 2),
+            'CPU_Per_Core': '-',
+            'RAM_Used_MB': round(df_active['RAM_Used_MB'].max(), 1),
+            'RAM_Percent_%': round(df_active['RAM_Percent_%'].max(), 2)
+        }
+        
+        # An CSV anhÃ¤ngen
+        with open(csv_file, 'a', newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=stats.keys())
+            f.write('\n')  # Leerzeile
+            
+            # Ãœberschrift in CSV schreiben
+            f.write(f"STATISTIKEN (basierend auf {len(df_active)} aktiven Frames)\n")
+            f.write("="*60 + "\n")
+            
+            # Detaillierte Statistiken
+            f.write(f"FPS:          Ã˜ {stats['FPS']:6.2f} | Median {median_stats['FPS']:6.2f} | Min {min_stats['FPS']:6.2f} | Max {max_stats['FPS']:6.2f}\n")
+            f.write(f"CPU [%]:      Ã˜ {stats['CPU_Gesamt_%']:6.2f} | Median {median_stats['CPU_Gesamt_%']:6.2f} | Min {min_stats['CPU_Gesamt_%']:6.2f} | Max {max_stats['CPU_Gesamt_%']:6.2f}\n")
+            f.write(f"RAM [MB]:     Ã˜ {stats['RAM_Used_MB']:6.1f} | Median {median_stats['RAM_Used_MB']:6.1f} | Min {min_stats['RAM_Used_MB']:6.1f} | Max {max_stats['RAM_Used_MB']:6.1f}\n")
+            f.write(f"RAM [%]:      Ã˜ {stats['RAM_Percent_%']:6.2f} | Median {median_stats['RAM_Percent_%']:6.2f} | Min {min_stats['RAM_Percent_%']:6.2f} | Max {max_stats['RAM_Percent_%']:6.2f}\n")
+            f.write("="*60 + "\n")
+        
+        # Konsolenausgabe
+        print(f"\n{'='*60}")
+        print(f"STATISTIKEN (basierend auf {len(df_active)} aktiven Frames)")
+        print(f"{'='*60}")
+        print(f"FPS:          Ã˜ {stats['FPS']:6.2f} | Median {median_stats['FPS']:6.2f} | Min {min_stats['FPS']:6.2f} | Max {max_stats['FPS']:6.2f}")
+        print(f"CPU [%]:      Ã˜ {stats['CPU_Gesamt_%']:6.2f} | Median {median_stats['CPU_Gesamt_%']:6.2f} | Min {min_stats['CPU_Gesamt_%']:6.2f} | Max {max_stats['CPU_Gesamt_%']:6.2f}")
+        print(f"RAM [MB]:     Ã˜ {stats['RAM_Used_MB']:6.1f} | Median {median_stats['RAM_Used_MB']:6.1f} | Min {min_stats['RAM_Used_MB']:6.1f} | Max {max_stats['RAM_Used_MB']:6.1f}")
+        print(f"RAM [%]:      Ã˜ {stats['RAM_Percent_%']:6.2f} | Median {median_stats['RAM_Percent_%']:6.2f} | Min {min_stats['RAM_Percent_%']:6.2f} | Max {max_stats['RAM_Percent_%']:6.2f}")
+        print(f"{'='*60}\n")
+        
+    except Exception as e:
+        print(f"[FEHLER] Statistik-Berechnung fehlgeschlagen: {e}")
+# ==============================================================
+
+if __name__ == "__main__":
+    # Parse command-line arguments.
+    parser = argparse.ArgumentParser(description="Detection Example with Performance Monitoring")
+    parser.add_argument("-m", "--model", help="Path for the HEF model.",
+                        default="/usr/share/hailo-models/yolov8s_h8l.hef")
+    parser.add_argument("-l", "--labels", default="coco.txt",
+                        help="Path to a text file containing labels.")
+    parser.add_argument("-s", "--score_thresh", type=float, default=0.5,
+                        help="Score threshold, must be a float between 0 and 1.")
+    parser.add_argument("--monitoring-output", type=str, default="hailo_performance_monitoring.csv",
+                        help="Output CSV file for performance monitoring")
+    args = parser.parse_args()
+    # Get the Hailo model, the input size it wants, and the size of our preview stream.
+    with Hailo(args.model) as hailo:
+        model_h, model_w, _ = hailo.get_input_shape()
+        video_w, video_h = 1280, 960
+        # Load class names from the labels file
+        with open(args.labels, 'r', encoding="utf-8") as f:
+            class_names = f.read().splitlines()
+        # The list of detected objects to draw.
+        detections = None
+        # Configure and start Picamera2.
+        with Picamera2() as picam2:
+            main = {'size': (video_w, video_h), 'format': 'XRGB8888'}
+            lores = {'size': (model_w, model_h), 'format': 'RGB888'}
+            controls = {'FrameRate': 30}
+            config = picam2.create_preview_configuration(main, lores=lores, controls=controls)
+            picam2.configure(config)
+            picam2.start_preview(Preview.QTGL, x=0, y=0, width=video_w, height=video_h)
+            picam2.start()
+            picam2.pre_callback = draw_objects
+            # ==================== MONITORING STARTEN ====================
+            psutil.cpu_percent(interval=None)
+            start_monitoring(args.monitoring_output)
+            # ============================================================
+            try:
+                # Process each low resolution camera frame.
+                while True:
+                    frame = picam2.capture_array('lores')
+                    # Run inference on the preprocessed frame
+                    results = hailo.run(frame)
+                    # Extract detections from the inference results
+                    detections = extract_detections(results, video_w, video_h, class_names, args.score_thresh)
+                    
+            except KeyboardInterrupt:
+                print("\n[INFO] Beende Anwendung...")
+            finally:
+                # ==================== MONITORING BEENDEN ====================
+                stop_monitoring(args.monitoring_output)
+                picam2.stop()
+                # ============================================================
